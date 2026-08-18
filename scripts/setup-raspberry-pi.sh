@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+#
+# Prepara um Raspberry Pi (ou qualquer Debian/Ubuntu) para rodar o RobotEye.
+#
+# Uso:
+#   ./scripts/setup-raspberry-pi.sh                     instalação padrão (pergunta o que falta)
+#   ./scripts/setup-raspberry-pi.sh --bluetooth         também configura áudio Bluetooth
+#   ./scripts/setup-raspberry-pi.sh --service           também instala o serviço systemd
+#   ./scripts/setup-raspberry-pi.sh --voice dora        usa outra voz
+#   ./scripts/setup-raspberry-pi.sh --ollama IP:PORTA   endereço da máquina com a IA
+#   ./scripts/setup-raspberry-pi.sh --model qwen3:8b    modelo de linguagem
+#   ./scripts/setup-raspberry-pi.sh --no-llm            instala sem IA (modo echo)
+#   ./scripts/setup-raspberry-pi.sh --yes               não pergunta nada (para automação)
+#
+# O script é idempotente: rodar de novo apenas atualiza o que faltar.
+
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENV_DIR="${REPO_DIR}/.venv"
+
+VOICE=""
+MODEL=""
+OLLAMA_HOST=""
+NO_LLM=false
+ASSUME_YES=false
+WITH_BLUETOOTH=false
+WITH_SERVICE=false
+
+# --- aparência --------------------------------------------------------------
+BOLD=$(tput bold 2>/dev/null || true)
+RESET=$(tput sgr0 2>/dev/null || true)
+
+step()  { echo; echo "${BOLD}==> $*${RESET}"; }
+info()  { echo "    $*"; }
+warn()  { echo "    [aviso] $*" >&2; }
+fail()  { echo "    [erro] $*" >&2; exit 1; }
+
+# --- argumentos -------------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --bluetooth) WITH_BLUETOOTH=true; shift ;;
+        --service)   WITH_SERVICE=true; shift ;;
+        --voice)     VOICE="${2:?--voice exige um nome}"; shift 2 ;;
+        --model)     MODEL="${2:?--model exige um nome}"; shift 2 ;;
+        --ollama)    OLLAMA_HOST="${2:?--ollama exige um endereço}"; shift 2 ;;
+        --no-llm)    NO_LLM=true; shift ;;
+        -y|--yes)    ASSUME_YES=true; shift ;;
+        -h|--help)   sed -n '2,18p' "$0"; exit 0 ;;
+        *)           fail "opção desconhecida: $1 (use --help)" ;;
+    esac
+done
+
+[[ $EUID -eq 0 ]] && fail "não rode como root; o script chama sudo quando precisa"
+
+echo "${BOLD}"
+echo "======================================"
+echo "        ROBOT EYE - SETUP"
+echo "======================================"
+echo "${RESET}"
+info "repositório: ${REPO_DIR}"
+
+# --- 1. dependências de sistema ---------------------------------------------
+step "[1/4] Instalando dependências do sistema"
+sudo apt-get update -qq
+sudo apt-get install -y \
+    python3 \
+    python3-venv \
+    python3-pip \
+    python3-dev \
+    libportaudio2 \
+    libsdl2-2.0-0 \
+    libsdl2-ttf-2.0-0 \
+    alsa-utils \
+    git
+info "ok"
+
+# --- 2. ambiente virtual ----------------------------------------------------
+step "[2/4] Preparando o ambiente Python"
+if [[ ! -d "${VENV_DIR}" ]]; then
+    python3 -m venv "${VENV_DIR}"
+    info "ambiente virtual criado em ${VENV_DIR}"
+else
+    info "ambiente virtual já existe"
+fi
+
+"${VENV_DIR}/bin/pip" install --quiet --upgrade pip
+# `online` traz as vozes da nuvem; `tts` traz a voz local que assume quando a
+# rede cai. As duas juntas são o que faz o robô continuar falando de qualquer jeito.
+"${VENV_DIR}/bin/pip" install --quiet -e "${REPO_DIR}[tts,online]"
+info "pacote instalado (voz local + voz na nuvem)"
+
+# --- 3. configuração --------------------------------------------------------
+# Quem responde "onde roda a IA, qual modelo, qual voz" é o assistente do
+# próprio pacote: ele testa o endereço antes de gravar e lista os modelos que a
+# máquina realmente tem. Aqui só repassamos o que veio por flag.
+step "[3/4] Configuração"
+
+# `x && y` como comando solto encerraria o script sob `set -e` sempre que a
+# condição fosse falsa — daí os `if`.
+SETUP_ARGS=()
+if [[ -n "${VOICE}" ]];       then SETUP_ARGS+=(--voice "${VOICE}"); fi
+if [[ -n "${MODEL}" ]];       then SETUP_ARGS+=(--model "${MODEL}"); fi
+if [[ -n "${OLLAMA_HOST}" ]]; then SETUP_ARGS+=(--ollama "${OLLAMA_HOST}"); fi
+if [[ "${NO_LLM}" == true ]]; then SETUP_ARGS+=(--no-llm); fi
+# Sem terminal — instalação automatizada, `curl | bash`, Ansible — perguntar
+# seria esperar por uma resposta que nunca vem.
+if [[ "${ASSUME_YES}" == true ]] || [[ ! -t 0 ]]; then
+    SETUP_ARGS+=(--non-interactive)
+fi
+
+# A expansão longa mantém o array vazio inofensivo sob `set -u`.
+"${VENV_DIR}/bin/roboteye" setup ${SETUP_ARGS[@]+"${SETUP_ARGS[@]}"}
+
+# PIN fixo da página de configuração. Sem um gravado aqui, o robô sorteia um a
+# cada arranque — e num robô que liga sozinho isso significaria caçar o PIN no
+# log toda vez que alguém quisesse mexer nele pelo celular.
+if ! grep -q "^ROBOTEYE_WEB_PIN=..*" "${REPO_DIR}/.env"; then
+    PIN="$(shuf -i 100000-999999 -n 1)"
+    if grep -q "^ROBOTEYE_WEB_PIN=" "${REPO_DIR}/.env"; then
+        sed -i "s|^ROBOTEYE_WEB_PIN=.*|ROBOTEYE_WEB_PIN=${PIN}|" "${REPO_DIR}/.env"
+    else
+        printf 'ROBOTEYE_WEB_PIN=%s\n' "${PIN}" >> "${REPO_DIR}/.env"
+    fi
+    info "PIN da página de configuração: ${PIN}"
+fi
+
+# --- 4. extras opcionais ----------------------------------------------------
+step "[4/4] Extras"
+
+if [[ "${WITH_BLUETOOTH}" == true ]]; then
+    info "configurando áudio Bluetooth..."
+    sudo apt-get install -y pulseaudio pulseaudio-module-bluetooth bluez
+    sudo systemctl enable bluetooth
+    sudo systemctl start bluetooth
+    sudo rfkill unblock bluetooth || warn "rfkill falhou (pode não haver rádio Bluetooth)"
+    info "Bluetooth pronto. Pareie o alto-falante com: bluetoothctl"
+else
+    info "Bluetooth não configurado (use --bluetooth se precisar)"
+fi
+
+if [[ "${WITH_SERVICE}" == true ]]; then
+    SERVICE_FILE=/etc/systemd/system/roboteye.service
+    info "instalando serviço systemd..."
+    sed -e "s|@USER@|${USER}|g" -e "s|@REPO_DIR@|${REPO_DIR}|g" \
+        "${REPO_DIR}/scripts/roboteye.service" | sudo tee "${SERVICE_FILE}" >/dev/null
+    sudo systemctl daemon-reload
+    sudo systemctl enable roboteye.service
+    info "serviço instalado. Inicie com: sudo systemctl start roboteye"
+else
+    info "serviço systemd não instalado (use --service para o robô subir no boot)"
+fi
+
+# --- verificação final ------------------------------------------------------
+step "Verificando a instalação"
+"${VENV_DIR}/bin/roboteye" doctor || warn "há pendências no diagnóstico acima"
+
+cat <<EOF
+
+${BOLD}======================================
+    Setup concluído!
+======================================${RESET}
+
+Para usar:
+
+    source ${VENV_DIR}/bin/activate
+    roboteye                    # face + chat
+    roboteye run --fullscreen   # tela cheia
+    roboteye chat               # sem janela (útil via SSH)
+
+Para trocar de IA, modelo ou voz depois:
+
+    roboteye setup              # o mesmo assistente, de novo
+    roboteye models             # o que a máquina da IA tem instalado
+
+Se o diagnóstico acusou o LLM como inacessível, lembre-se de subir o Ollama
+na outra máquina com:
+
+    OLLAMA_HOST=0.0.0.0 ollama serve
+
+EOF
