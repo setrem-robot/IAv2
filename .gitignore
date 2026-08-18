@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+
+# Configuracao local (contem IPs/segredos do seu ambiente)
+.env
+
+# O que voce ensinou ao robo e pessoal, como o .env.
+# A persona em si (persona/*.md) fica versionada; so a memoria nao.
+persona/*.memoria.md
+
+# Modelos de voz (arquivos grandes, baixados via `roboteye voice download`)
+models/
+*.onnx
+*.onnx.json
+
+# Audio temporario
+*.wav
+!tests/**/*.wav
+
+# Folha de expressoes gerada por `roboteye preview`
+preview.png
+
+# Ferramentas
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Configuracao local do Claude Code (o agente do projeto fica versionado;
+# permissoes e preferencias da maquina, nao)
+.claude/settings.local.json
+
+# Editores / SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

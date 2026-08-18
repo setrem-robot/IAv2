@@ -1,0 +1,17 @@
+# Normaliza as quebras de linha no repositório.
+# Sem isto, arquivos criados no Windows chegam ao Raspberry Pi com CRLF e os
+# scripts shell falham com "bad interpreter: /usr/bin/env bash^M".
+* text=auto eol=lf
+
+*.sh       text eol=lf
+*.service  text eol=lf
+*.py       text eol=lf
+*.toml     text eol=lf
+*.yml      text eol=lf
+*.md       text eol=lf
+
+# Arquivos binários nunca devem ser convertidos.
+*.png   binary
+*.jpg   binary
+*.wav   binary
+*.onnx  binary
