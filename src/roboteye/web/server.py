@@ -1,0 +1,370 @@
+"""Pagina de configuracao servida pelo proprio robo.
+
+O robo roda de tela cheia, sem teclado e muitas vezes preso atras de um monitor.
+Trocar a voz ou apontar para outra maquina de IA exigia abrir um terminal noutro
+computador, achar o IP, entrar por SSH e editar um arquivo. Aqui isso vira abrir
+o navegador do celular.
+
+**O que ela resolve de verdade.** A IA roda noutra maquina, alcancada por VPN, e
+esse endereco muda: troca de rede, troca de servidor, VPN que caiu. O botao que
+testa a conexao *antes* de salvar e a razao de existir desta pagina — sem ele,
+descobrir que o endereco esta errado exige reiniciar o robo e esperar ele falhar
+falando.
+
+**Sobre seguranca.** A pagina mostra e altera enderecos da rede interna, faz o
+robo falar e reinicia o servico. Numa rede de faculdade isso nao pode ficar
+aberto, entao ha um PIN. Ele nao pretende resistir a um atacante determinado com
+acesso a rede — pretende impedir que qualquer um que descubra a porta mexa no
+robo. Para valer contra mais que isso, ponha o robo numa VLAN propria.
+
+Nao ha framework aqui de proposito: uma pagina e cinco rotas cabem na biblioteca
+padrao, e o robo nao precisa carregar um servidor web inteiro na memoria para
+isso.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import secrets
+import threading
+import time
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+from roboteye.config import PROJECT_ROOT, Settings
+from roboteye.logging_setup import get_logger
+from roboteye.web import envfile
+from roboteye.web.page import PAGE
+
+logger = get_logger(__name__)
+
+DEFAULT_PORT = 8080
+
+#: Depois de tantas tentativas erradas de PIN, o servidor para de responder por
+#: um tempo. Um PIN de seis digitos cai rapido a forca bruta sem isto.
+MAX_ATTEMPTS = 5
+LOCKOUT_SECONDS = 60.0
+
+#: Chaves que a pagina pode escrever. Uma lista fechada e o que impede a pagina
+#: de virar um editor arbitrario do ambiente do processo.
+EDITABLE = (
+    "ROBOTEYE_OLLAMA_HOST",
+    "ROBOTEYE_LLM_MODEL",
+    "ROBOTEYE_LLM_BACKEND",
+    "ROBOTEYE_VOICE",
+    "ROBOTEYE_VOICE_FALLBACK",
+    "ROBOTEYE_VOICE_GAIN",
+    "ROBOTEYE_VOICE_LENGTH_SCALE",
+    "ROBOTEYE_PERSONA",
+    "ROBOTEYE_REPLY_LANGUAGE",
+    "ROBOTEYE_FACE_FULLSCREEN",
+    "ROBOTEYE_FACE_QUALITY",
+    "ROBOTEYE_EYE_COLOR",
+    "ROBOTEYE_LOG_LEVEL",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class WebConfig:
+    """Como a pagina de configuracao sobe."""
+
+    host: str = "0.0.0.0"
+    port: int = DEFAULT_PORT
+    pin: str = ""
+    env_path: Path = PROJECT_ROOT / ".env"
+
+
+class _Gatekeeper:
+    """Confere o PIN e segura quem erra demais."""
+
+    def __init__(self, pin: str) -> None:
+        self._pin = pin
+        self._lock = threading.Lock()
+        self._failures = 0
+        self._blocked_until = 0.0
+
+    def allows(self, offered: str | None) -> bool:
+        with self._lock:
+            if time.monotonic() < self._blocked_until:
+                return False
+            # Comparacao em tempo constante: um PIN curto comparado com `==`
+            # vaza, pelo tempo de resposta, quantos digitos ja estao certos.
+            if offered and secrets.compare_digest(offered, self._pin):
+                self._failures = 0
+                return True
+
+            self._failures += 1
+            if self._failures >= MAX_ATTEMPTS:
+                self._failures = 0
+                self._blocked_until = time.monotonic() + LOCKOUT_SECONDS
+                logger.warning(
+                    "PIN errado %d vezes; pausando por %ds", MAX_ATTEMPTS, LOCKOUT_SECONDS
+                )
+            return False
+
+
+class ConfigServer:
+    """Servidor da pagina de configuracao, rodando numa thread propria."""
+
+    def __init__(self, config: WebConfig) -> None:
+        self._config = config
+        self._gate = _Gatekeeper(config.pin)
+        self._server: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+
+    @property
+    def port(self) -> int:
+        return self._server.server_address[1] if self._server else self._config.port
+
+    def start(self) -> None:
+        """Sobe o servidor em segundo plano. Idempotente."""
+        if self._thread is not None:
+            return
+
+        handler = _make_handler(self._config, self._gate)
+        self._server = ThreadingHTTPServer((self._config.host, self._config.port), handler)
+        self._server.daemon_threads = True
+        self._thread = threading.Thread(target=self._server.serve_forever, name="web", daemon=True)
+        self._thread.start()
+        logger.info("configuracao em http://%s:%d", _readable_host(self._config.host), self.port)
+
+    def stop(self) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+            self._server = None
+        self._thread = None
+
+    def __enter__(self) -> ConfigServer:
+        self.start()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.stop()
+
+
+# ---------------------------------------------------------------------------
+# Rotas
+# ---------------------------------------------------------------------------
+def _make_handler(config: WebConfig, gate: _Gatekeeper) -> type[BaseHTTPRequestHandler]:
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "RobotEye"
+
+        def log_message(self, fmt: str, *args: Any) -> None:
+            # O log padrao do http.server escreve em stderr e polui o terminal
+            # do chat. Rebaixa para debug.
+            logger.debug("web: " + fmt, *args)
+
+        # -- entrada -----------------------------------------------------
+        def do_GET(self) -> None:
+            path = urlparse(self.path).path
+            if path in {"/", "/index.html"}:
+                self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
+            elif path == "/api/state":
+                self._guarded(lambda _: _state(config))
+            else:
+                self._json(404, {"erro": "rota desconhecida"})
+
+        def do_POST(self) -> None:
+            path = urlparse(self.path).path
+            rotas = {
+                "/api/config": lambda body: _save(config, body),
+                "/api/test/llm": _test_llm,
+                "/api/test/voice": _test_voice,
+                "/api/restart": _restart,
+            }
+            handler = rotas.get(path)
+            if handler is None:
+                self._json(404, {"erro": "rota desconhecida"})
+                return
+            self._guarded(handler)
+
+        # -- apoio -------------------------------------------------------
+        def _guarded(self, action) -> None:
+            if not gate.allows(self.headers.get("X-Pin")):
+                self._json(401, {"erro": "PIN invalido ou tentativas demais"})
+                return
+            try:
+                self._json(200, action(self._body()))
+            except Exception as exc:
+                logger.exception("falha na pagina de configuracao")
+                self._json(500, {"erro": str(exc)})
+
+        def _body(self) -> dict[str, Any]:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length <= 0:
+                return {}
+            raw = self.rfile.read(length)
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                return {}
+            return data if isinstance(data, dict) else {}
+
+        def _json(self, status: int, payload: dict[str, Any]) -> None:
+            self._send(status, json.dumps(payload).encode("utf-8"), "application/json")
+
+        def _send(self, status: int, body: bytes, content_type: str) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+    return Handler
+
+
+def _state(config: WebConfig) -> dict[str, Any]:
+    """Configuracao atual mais o que o catalogo oferece."""
+    from roboteye import voice_catalog
+
+    valores = envfile.read(config.env_path)
+    vozes = [
+        {
+            "key": key,
+            "descricao": spec.description,
+            "idioma": spec.language,
+            "online": spec.engine == "edge",
+        }
+        for key, spec in sorted(voice_catalog.CATALOG.items())
+    ]
+    personas = sorted(
+        p.stem for p in (PROJECT_ROOT / "persona").glob("*.md") if not p.stem.endswith(".memoria")
+    )
+    return {
+        "config": {chave: valores.get(chave, "") for chave in EDITABLE},
+        "vozes": vozes,
+        "personas": personas,
+    }
+
+
+def _save(config: WebConfig, body: dict[str, Any]) -> dict[str, Any]:
+    """Grava as chaves permitidas e confere que o resultado ainda carrega."""
+    changes = {chave: str(body[chave]).strip() for chave in EDITABLE if chave in body}
+    if not changes:
+        return {"salvo": 0}
+
+    anterior = envfile.read(config.env_path)
+    envfile.update(config.env_path, changes)
+
+    # Uma configuracao invalida so apareceria no proximo arranque, quando o robo
+    # ja nao teria como avisar. Melhor conferir agora e desfazer.
+    try:
+        validate(config.env_path)
+    except Exception as exc:
+        envfile.update(config.env_path, {c: anterior.get(c, "") for c in changes})
+        raise ValueError(f"configuracao recusada, nada foi mudado: {exc}") from exc
+
+    return {"salvo": len(changes), "reiniciar": True}
+
+
+#: `os.environ` e do processo inteiro, e a validacao precisa mexer nele.
+#: Duas validacoes ao mesmo tempo se atrapalhariam.
+_ENV_LOCK = threading.Lock()
+
+
+def validate(env_path: Path) -> Settings:
+    """Confere se o arquivo, como esta agora, produz uma configuracao valida.
+
+    Nao da para simplesmente chamar `Settings.from_env(env_file=...)`: ela usa
+    `load_dotenv(override=False)`, que respeita o que ja esta no ambiente. Como
+    o robo carregou o `.env` ao subir, os valores antigos continuam em
+    `os.environ` e o arquivo recem-escrito seria ignorado — a conferencia
+    aprovaria qualquer coisa, inclusive uma voz que nao existe.
+
+    Entao o ambiente e trocado pelo conteudo do arquivo, a configuracao e
+    montada, e o ambiente volta ao que era. O robo em execucao nao percebe:
+    ele so le a configuracao ao arrancar.
+    """
+    valores = envfile.read(env_path)
+    anterior = dict(os.environ)
+
+    with _ENV_LOCK:
+        try:
+            for chave in [c for c in os.environ if c.startswith("ROBOTEYE_")]:
+                del os.environ[chave]
+            os.environ.update({c: v for c, v in valores.items() if c.startswith("ROBOTEYE_")})
+            # Um caminho inexistente impede `from_env` de recarregar o arquivo
+            # por cima do ambiente que acabamos de montar.
+            return Settings.from_env(env_file=env_path.parent / ".env.nao-existe")
+        finally:
+            os.environ.clear()
+            os.environ.update(anterior)
+
+
+def _test_llm(body: dict[str, Any]) -> dict[str, Any]:
+    """Bate na maquina da IA e diz o que achou — sem precisar salvar antes.
+
+    E o coracao da pagina. O endereco vem por VPN e muda de lugar; poder testar
+    um candidato antes de grava-lo evita o ciclo de salvar, reiniciar e esperar
+    o robo falhar falando para so entao descobrir que o IP estava errado.
+    """
+    from roboteye.llm.probe import probe_ollama
+
+    resultado = probe_ollama(str(body.get("host") or ""))
+    if not resultado.ok:
+        return {"ok": False, "erro": resultado.error, "host": resultado.host}
+    return {
+        "ok": True,
+        "host": resultado.host,
+        "ms": resultado.latency_ms,
+        "modelos": list(resultado.models),
+    }
+
+
+def _test_voice(body: dict[str, Any]) -> dict[str, Any]:
+    """Faz o robo falar uma frase, para conferir voz e alto-falante de uma vez."""
+    from roboteye.speech.factory import create_tts_engine
+    from roboteye.speech.player import create_audio_sink
+    from roboteye.speech.speaker import synthesize_polished
+
+    texto = str(body.get("texto") or "Oi! Estou funcionando.").strip()[:200]
+    settings = Settings.from_env()
+
+    engine = create_tts_engine(settings.voice)
+    sink = create_audio_sink(settings.voice)
+    try:
+        blocos = 0
+        for chunk in synthesize_polished(engine, texto, language=settings.voice.language):
+            sink.start(chunk.format)
+            sink.write(chunk.audio)
+            blocos += 1
+    finally:
+        sink.close()
+        engine.close()
+
+    return {"ok": blocos > 0, "voz": settings.voice.voice, "motor": settings.voice.engine}
+
+
+def _restart(_: dict[str, Any]) -> dict[str, Any]:
+    """Reinicia o servico para a configuracao nova valer."""
+    import shutil
+    import subprocess
+
+    if shutil.which("systemctl") is None:
+        return {"ok": False, "erro": "sem systemd aqui; reinicie o robo a mao"}
+
+    resultado = subprocess.run(
+        ["systemctl", "restart", "roboteye"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if resultado.returncode != 0:
+        erro = resultado.stderr.strip() or "systemctl recusou"
+        return {"ok": False, "erro": erro}
+    return {"ok": True}
+
+
+def _readable_host(host: str) -> str:
+    return "<ip-do-robo>" if host in {"0.0.0.0", ""} else host
+
+
+def generate_pin() -> str:
+    """PIN de seis digitos, sorteado de forma criptografica."""
+    return f"{secrets.randbelow(1_000_000):06d}"
