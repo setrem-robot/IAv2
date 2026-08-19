@@ -61,8 +61,8 @@ dev = [
 roboteye = "roboteye.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/kerlonr/RobotEye"
-Repository = "https://github.com/kerlonr/RobotEye"
+Homepage = "https://github.com/setrem-robot/IAv2"
+Repository = "https://github.com/setrem-robot/IAv2"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/roboteye"]

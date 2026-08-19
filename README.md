@@ -105,8 +105,8 @@ roda nesta máquina ou em qualquer outra da rede — e dá para começar sem ela
 ### Um script, e está pronto
 
 ```bash
-git clone https://github.com/kerlonr/RobotEye.git
-cd RobotEye
+git clone https://github.com/setrem-robot/IAv2.git
+cd IAv2
 ```
 
 **Linux / Raspberry Pi**
@@ -626,8 +626,8 @@ tempos e amplitudes de cada camada são constantes nomeadas no topo de
 ## Raspberry Pi
 
 ```bash
-git clone https://github.com/kerlonr/RobotEye.git
-cd RobotEye
+git clone https://github.com/setrem-robot/IAv2.git
+cd IAv2
 ./scripts/setup-raspberry-pi.sh --service --ollama 192.168.1.50:11434
 ```
 
